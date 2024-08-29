@@ -201,13 +201,18 @@ class LlamaRotaryEmbedding(nn.Module):
             self._dynamic_frequency_update(position_ids, device=x.device)
 
         # Core RoPE block
+        # inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).float().to(device) / dim))
+        # inv_freq theta shape = (1, dim/2, 1)
+        # position_ids_expanded shape (batch_size, 1, sequence_length)
+        # (1, dim/2, sequence_length)
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
-        position_ids_expanded = position_ids[:, None, :].float()
+        position_ids_expanded = position_ids[:, None, :].float() # shape (batch_size, 1, sequence_length)
         # Force float32 (see https://github.com/huggingface/transformers/pull/29285)
         device_type = x.device.type
         device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            # freqs shape (1, sequence_length, dim / 2)
             emb = torch.cat((freqs, freqs), dim=-1)
             cos = emb.cos()
             sin = emb.sin()
@@ -215,7 +220,7 @@ class LlamaRotaryEmbedding(nn.Module):
         # Advanced RoPE types (e.g. yarn) apply a post-processing scaling factor, equivalent to scaling attention
         cos = cos * self.attention_scaling
         sin = sin * self.attention_scaling
-
+        # cos shape (1, sequence_length, dim)
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
@@ -271,6 +276,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
+    # cos shape (1, sequence_length, dim)
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
@@ -317,6 +323,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
     num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
     """
+    # key_states --> (batch, num_key_value_heads, seq_len, head_dim)
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
@@ -354,6 +361,7 @@ class LlamaAttention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
 
         # TODO (joao): remove in v4.45 (RoPE is computed in the model, not in the decoder layers)
+        # rotary_emb包含cos/size shape (batch_size, sequence_length, dim)
         self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
 
     def forward(
@@ -388,10 +396,17 @@ class LlamaAttention(nn.Module):
             value_states = torch.cat(value_states, dim=-1)
 
         else:
+
+            # query_states --> (batch, seq_len, hidden_size)
+            # key_states --> (batch, seq_len, num_key_value_heads*head_dim)
+            # value_states --> (batch, seq_len, num_key_value_heads*head_dim)
             query_states = self.q_proj(hidden_states)
             key_states = self.k_proj(hidden_states)
             value_states = self.v_proj(hidden_states)
 
+        # query_states --> (batch, num_heads, seq_len, head_dim)
+        # key_states --> (batch, num_key_value_heads, seq_len, head_dim)
+        # value_states --> (batch, num_key_value_heads, seq_len, head_dim)
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -413,6 +428,9 @@ class LlamaAttention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
+        # query_states --> (batch, num_heads, seq_len, head_dim)
+        # key_states --> (batch, num_heads, seq_len, head_dim)
+        # value_states --> (batch, num_heads, seq_len, head_dim)
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
@@ -422,8 +440,10 @@ class LlamaAttention(nn.Module):
             attn_weights = attn_weights + causal_mask
 
         # upcast attention to fp32
+        # attn_weights --> (batch, num_heads, seq_len, seq_len)
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        # attn_output --> (batch, num_heads, seq_len, head_dim)
         attn_output = torch.matmul(attn_weights, value_states)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
@@ -432,8 +452,10 @@ class LlamaAttention(nn.Module):
                 f" {attn_output.size()}"
             )
 
+        # attn_output --> (batch, seq_len, num_heads, head_dim)
         attn_output = attn_output.transpose(1, 2).contiguous()
 
+        # attn_output --> (batch, seq_len, hidden_size)
         attn_output = attn_output.reshape(bsz, q_len, -1)
 
         if self.config.pretraining_tp > 1:
@@ -441,6 +463,7 @@ class LlamaAttention(nn.Module):
             o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
             attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
         else:
+            # attn_output --> (batch, seq_len, hidden_size)
             attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
